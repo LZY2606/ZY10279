@@ -1,0 +1,872 @@
+use std::borrow::Cow;
+use std::cell::Cell;
+
+use ::serde::de::DeserializeSeed;
+use ::serde::de::EnumAccess;
+use ::serde::de::IntoDeserializer;
+use ::serde::de::MapAccess;
+use ::serde::de::SeqAccess;
+use ::serde::de::VariantAccess;
+use ::serde::de::Visitor;
+use ::serde::forward_to_deserialize_any;
+
+use super::ParseOptions;
+use super::common::Range;
+use super::errors::ParseError;
+use super::errors::ParseErrorKind;
+use super::tokens::Token;
+use crate::parser::JsoncParser;
+
+/// Parses a string containing JSONC to a `serde_json::Value` or any
+/// type that implements `serde::Deserialize`.
+///
+/// Requires the "serde" cargo feature:
+///
+/// ```toml
+/// jsonc-parser = { version = "...", features = ["serde"] }
+/// ```
+///
+/// # Example
+///
+/// Parsing to a `serde_json::Value`:
+///
+/// ```rs
+/// use jsonc_parser::parse_to_serde_value;
+///
+/// let json_value: serde_json::Value = parse_to_serde_value(
+///   r#"{ "test": 5 } // test"#,
+///   &Default::default(),
+/// ).unwrap();
+/// ```
+///
+/// Or to a concrete type:
+///
+/// ```rs
+/// use jsonc_parser::parse_to_serde_value;
+///
+/// #[derive(serde::Deserialize)]
+/// struct Config {
+///   test: u32,
+/// }
+///
+/// let config: Config = parse_to_serde_value(
+///   r#"{ "test": 5 } // test"#,
+///   &Default::default(),
+/// ).unwrap();
+/// ```
+///
+/// Empty or whitespace-only input deserializes as `null`, which means
+/// `Option<T>` will produce `None` while other types will return a
+/// type-mismatch error.
+pub fn parse_to_serde_value<T: ::serde::de::DeserializeOwned>(
+  text: &str,
+  parse_options: &ParseOptions,
+) -> Result<T, ParseError> {
+  let mut parser = JsoncParser::new(text, parse_options);
+
+  let token = parser.scan()?;
+  match token {
+    Some(token) => parser.put_back(token),
+    None => parser.put_back(Token::Null),
+  }
+
+  let value = T::deserialize(&mut parser)?;
+  if parser.scan()?.is_some() {
+    return Err(
+      parser
+        .scanner
+        .create_error_for_current_token(ParseErrorKind::MultipleRootJsonValues),
+    );
+  }
+  Ok(value)
+}
+
+impl ::serde::de::Error for ParseError {
+  fn custom<T: std::fmt::Display>(msg: T) -> Self {
+    ParseError::custom_err(msg.to_string())
+  }
+}
+
+impl<'de> ::serde::Deserializer<'de> for &mut JsoncParser<'de> {
+  type Error = ParseError;
+
+  fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+    match self.scan()? {
+      None => Err(ParseError::custom_err("unexpected end of input".to_string())),
+      Some(token) => deserialize_token(self, token, visitor),
+    }
+  }
+
+  fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+    match self.scan()? {
+      Some(Token::Null) => visitor.visit_none(),
+      Some(token) => {
+        self.put_back(token);
+        visitor.visit_some(self)
+      }
+      None => visitor.visit_none(),
+    }
+  }
+
+  fn deserialize_enum<V: Visitor<'de>>(
+    self,
+    _name: &'static str,
+    _variants: &'static [&'static str],
+    visitor: V,
+  ) -> Result<V::Value, Self::Error> {
+    let token = self.scan()?;
+    let token_range = Range::new(self.scanner.token_start(), self.scanner.token_end());
+    let text = self.text;
+    let result = match token {
+      Some(Token::String(s)) => {
+        let variant: String = s.into_owned();
+        visitor.visit_enum(variant.into_deserializer())
+      }
+      Some(Token::OpenBrace) => {
+        // expect exactly one property: { "Variant": data }
+        let key = match self.scan()? {
+          Some(Token::String(s)) => s.into_owned(),
+          _ => {
+            return Err(ParseError::new(
+              token_range,
+              ParseErrorKind::Custom("expected a string key for enum variant".to_string()),
+              text,
+            ));
+          }
+        };
+
+        // expect colon
+        self.scan_object_colon()?;
+
+        let result = visitor.visit_enum(ObjectEnumAccess {
+          parser: self,
+          variant: key,
+        });
+        result.and_then(|v| {
+          // expect close brace
+          match self.scan()? {
+            Some(Token::CloseBrace) => Ok(v),
+            _ => Err(
+              self
+                .scanner
+                .create_error_for_current_token(ParseErrorKind::UnterminatedObject),
+            ),
+          }
+        })
+      }
+      _ => {
+        return Err(ParseError::new(
+          token_range,
+          ParseErrorKind::Custom("expected a string or object for enum".to_string()),
+          text,
+        ));
+      }
+    };
+    result.map_err(|e| e.with_position(token_range, text))
+  }
+
+  fn deserialize_newtype_struct<V: Visitor<'de>>(
+    self,
+    _name: &'static str,
+    visitor: V,
+  ) -> Result<V::Value, Self::Error> {
+    visitor.visit_newtype_struct(self)
+  }
+
+  forward_to_deserialize_any! {
+    bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64
+    char str string bytes byte_buf unit unit_struct
+    seq tuple tuple_struct map struct identifier ignored_any
+  }
+}
+
+fn deserialize_token<'de, V: Visitor<'de>>(
+  parser: &mut JsoncParser<'de>,
+  token: Token<'de>,
+  visitor: V,
+) -> Result<V::Value, ParseError> {
+  let token_range = Range::new(parser.scanner.token_start(), parser.scanner.token_end());
+  let text = parser.text;
+  let result = match token {
+    Token::Null => visitor.visit_unit(),
+    Token::Boolean(b) => visitor.visit_bool(b),
+    Token::Number(n) => visit_number(n, visitor),
+    Token::String(s) => match s {
+      Cow::Borrowed(b) => visitor.visit_borrowed_str(b),
+      Cow::Owned(o) => visitor.visit_string(o),
+    },
+    Token::OpenBracket => {
+      parser.enter_container()?;
+      let finished = Cell::new(false);
+      let result = visitor.visit_seq(ScannerSeqAccess {
+        parser,
+        first: true,
+        finished: &finished,
+      });
+      if result.is_ok() && !finished.get() {
+        if let Err(e) = drain_array(parser) {
+          parser.exit_container();
+          return Err(e);
+        }
+      }
+      parser.exit_container();
+      result
+    }
+    Token::OpenBrace => {
+      parser.enter_container()?;
+      let result = visitor.visit_map(ScannerMapAccess { parser, first: true });
+      parser.exit_container();
+      result
+    }
+    other => return Err(parser.unexpected_token_error(&other)),
+  };
+  result.map_err(|e| e.with_position(token_range, text))
+}
+
+// number handling
+
+fn visit_number<'de, V: Visitor<'de>>(raw: &str, visitor: V) -> Result<V::Value, ParseError> {
+  // handle hexadecimal
+  let trimmed = raw.trim_start_matches(['-', '+']);
+  if trimmed.len() > 2 && (trimmed.starts_with("0x") || trimmed.starts_with("0X")) {
+    let hex_part = &trimmed[2..];
+    let negative = raw.starts_with('-');
+    if let Ok(val) = i64::from_str_radix(hex_part, 16) {
+      return visitor.visit_i64(if negative { -val } else { val });
+    }
+    // fall back to an i128 for the values that don't fit in an i64, which
+    // are the ones that fit in a u64 and `i64::MIN`
+    return match i128::from_str_radix(hex_part, 16) {
+      Ok(val) => {
+        let val = if negative { -val } else { val };
+        if let Ok(val) = i64::try_from(val) {
+          visitor.visit_i64(val)
+        } else if let Ok(val) = u64::try_from(val) {
+          visitor.visit_u64(val)
+        } else {
+          Err(number_out_of_range_error())
+        }
+      }
+      Err(_) => Err(number_out_of_range_error()),
+    };
+  }
+
+  // strip unary plus
+  let num_str = raw.trim_start_matches('+');
+
+  if let Ok(v) = num_str.parse::<i64>() {
+    return visitor.visit_i64(v);
+  }
+  if let Ok(v) = num_str.parse::<u64>() {
+    return visitor.visit_u64(v);
+  }
+  match num_str.parse::<f64>() {
+    Ok(v) if v.is_finite() => visitor.visit_f64(v),
+    // `parse` resolves to infinity instead of erroring for numbers that are
+    // too large and the scanner only ever provides numbers an f64 can parse
+    _ => Err(number_out_of_range_error()),
+  }
+}
+
+/// Errors instead of silently changing the value's JSON type, which is what
+/// visiting a non-finite float would do (ex. `serde_json::Value` turns those
+/// into `null`).
+fn number_out_of_range_error() -> ParseError {
+  ParseError::custom_err("Number is out of range".to_string())
+}
+
+// array handling
+
+/// Consumes remaining array elements and the closing `]` when a visitor
+/// (e.g. for a tuple) stops reading before the end of the array.
+fn drain_array(parser: &mut JsoncParser) -> Result<(), ParseError> {
+  loop {
+    match parser.scan_array_comma()? {
+      Some(Token::CloseBracket) => return Ok(()),
+      Some(token) => {
+        parser.put_back(token);
+        <::serde::de::IgnoredAny as ::serde::Deserialize>::deserialize(&mut *parser)?;
+      }
+      None => {
+        return Err(
+          parser
+            .scanner
+            .create_error_for_current_token(ParseErrorKind::UnterminatedArray),
+        );
+      }
+    }
+  }
+}
+
+struct ScannerSeqAccess<'a, 'b> {
+  parser: &'b mut JsoncParser<'a>,
+  first: bool,
+  finished: &'b Cell<bool>,
+}
+
+impl<'de, 'b> SeqAccess<'de> for ScannerSeqAccess<'de, 'b> {
+  type Error = ParseError;
+
+  fn next_element_seed<T: DeserializeSeed<'de>>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error> {
+    let token = if self.first {
+      self.first = false;
+      self.parser.scan()?
+    } else {
+      self.parser.scan_array_comma()?
+    };
+
+    match token {
+      Some(Token::CloseBracket) => {
+        self.finished.set(true);
+        Ok(None)
+      }
+      Some(token) => {
+        self.parser.put_back(token);
+        seed.deserialize(&mut *self.parser).map(Some)
+      }
+      None => Err(
+        self
+          .parser
+          .scanner
+          .create_error_for_current_token(ParseErrorKind::UnterminatedArray),
+      ),
+    }
+  }
+}
+
+// object handling
+
+struct ScannerMapAccess<'a, 'b> {
+  parser: &'b mut JsoncParser<'a>,
+  first: bool,
+}
+
+impl<'de, 'b> MapAccess<'de> for ScannerMapAccess<'de, 'b> {
+  type Error = ParseError;
+
+  fn next_key_seed<K: DeserializeSeed<'de>>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error> {
+    let key = self.parser.scan_object_entry(self.first)?;
+    self.first = false;
+
+    match key {
+      None => Ok(None),
+      Some(key) => {
+        // borrow the key from the source when it's clean, only allocating for
+        // owned (escaped) keys — mirrors the value path's `Cow` keys
+        seed
+          .deserialize(<Cow<'de, str> as IntoDeserializer<Self::Error>>::into_deserializer(
+            key.into_cow(),
+          ))
+          .map(Some)
+      }
+    }
+  }
+
+  fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Self::Error> {
+    self.parser.scan_object_colon()?;
+    seed.deserialize(&mut *self.parser)
+  }
+}
+
+// enum handling
+
+struct ObjectEnumAccess<'a, 'b> {
+  parser: &'b mut JsoncParser<'a>,
+  variant: String,
+}
+
+impl<'de, 'b> EnumAccess<'de> for ObjectEnumAccess<'de, 'b> {
+  type Error = ParseError;
+  type Variant = ObjectVariantAccess<'de, 'b>;
+
+  fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self::Variant), Self::Error> {
+    let variant = seed.deserialize(<String as IntoDeserializer<Self::Error>>::into_deserializer(
+      self.variant,
+    ))?;
+    Ok((variant, ObjectVariantAccess { parser: self.parser }))
+  }
+}
+
+struct ObjectVariantAccess<'a, 'b> {
+  parser: &'b mut JsoncParser<'a>,
+}
+
+impl<'de, 'b> VariantAccess<'de> for ObjectVariantAccess<'de, 'b> {
+  type Error = ParseError;
+
+  fn unit_variant(self) -> Result<(), Self::Error> {
+    ::serde::Deserialize::deserialize(&mut *self.parser)
+  }
+
+  fn newtype_variant_seed<T: DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value, Self::Error> {
+    seed.deserialize(&mut *self.parser)
+  }
+
+  fn tuple_variant<V: Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error> {
+    match self.parser.scan()? {
+      Some(Token::OpenBracket) => {
+        self.parser.enter_container()?;
+        let finished = Cell::new(false);
+        let result = visitor.visit_seq(ScannerSeqAccess {
+          parser: self.parser,
+          first: true,
+          finished: &finished,
+        });
+        if result.is_ok() && !finished.get() {
+          if let Err(e) = drain_array(self.parser) {
+            self.parser.exit_container();
+            return Err(e);
+          }
+        }
+        self.parser.exit_container();
+        result
+      }
+      _ => Err(ParseError::custom_err(
+        "expected an array for tuple variant".to_string(),
+      )),
+    }
+  }
+
+  fn struct_variant<V: Visitor<'de>>(
+    self,
+    _fields: &'static [&'static str],
+    visitor: V,
+  ) -> Result<V::Value, Self::Error> {
+    match self.parser.scan()? {
+      Some(Token::OpenBrace) => {
+        self.parser.enter_container()?;
+        let result = visitor.visit_map(ScannerMapAccess {
+          parser: self.parser,
+          first: true,
+        });
+        self.parser.exit_container();
+        result
+      }
+      _ => Err(ParseError::custom_err(
+        "expected an object for struct variant".to_string(),
+      )),
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use pretty_assertions::assert_eq;
+  use serde_json::Value as SerdeValue;
+  use std::str::FromStr;
+
+  use super::*;
+
+  #[test]
+  fn it_should_error_when_has_error() {
+    assert_has_error(
+      "[][]",
+      "Text cannot contain more than one JSON value on line 1 column 3",
+    );
+  }
+
+  fn assert_has_error(text: &str, message: &str) {
+    let result = parse_to_serde_value::<SerdeValue>(text, &Default::default());
+    match result {
+      Ok(_) => panic!("Expected error, but did not find one."),
+      Err(err) => assert_eq!(err.to_string(), message),
+    }
+  }
+
+  #[test]
+  fn it_should_parse_to_serde_value() {
+    let result = parse_to_serde_value::<SerdeValue>(
+      r#"{ "a": { "a1": 5 }, "b": [0.3e+025], "c": "c1", "d": true, "e": false, "f": null }"#,
+      &Default::default(),
+    )
+    .unwrap();
+
+    let mut expected_value = serde_json::map::Map::new();
+    expected_value.insert("a".to_string(), {
+      let mut inner_obj = serde_json::map::Map::new();
+      inner_obj.insert(
+        "a1".to_string(),
+        SerdeValue::Number(serde_json::Number::from_str("5").unwrap()),
+      );
+      SerdeValue::Object(inner_obj)
+    });
+    expected_value.insert("b".to_string(), {
+      let mut inner_array = Vec::new();
+      inner_array.push(SerdeValue::Number(serde_json::Number::from_str("0.3e+025").unwrap()));
+      SerdeValue::Array(inner_array)
+    });
+    expected_value.insert("c".to_string(), SerdeValue::String("c1".to_string()));
+    expected_value.insert("d".to_string(), SerdeValue::Bool(true));
+    expected_value.insert("e".to_string(), SerdeValue::Bool(false));
+    expected_value.insert("f".to_string(), SerdeValue::Null);
+
+    assert_eq!(result, SerdeValue::Object(expected_value));
+  }
+
+  #[test]
+  fn it_should_parse_hexadecimal_numbers_to_decimal() {
+    let result = parse_to_serde_value::<SerdeValue>(
+      r#"{
+        "hex1": 0x7DF,
+        "hex2": 0xFF,
+        "hex3": 0x10
+      }"#,
+      &Default::default(),
+    )
+    .unwrap();
+
+    let mut expected_value = serde_json::map::Map::new();
+    expected_value.insert("hex1".to_string(), SerdeValue::Number(serde_json::Number::from(2015)));
+    expected_value.insert("hex2".to_string(), SerdeValue::Number(serde_json::Number::from(255)));
+    expected_value.insert("hex3".to_string(), SerdeValue::Number(serde_json::Number::from(16)));
+
+    assert_eq!(result, SerdeValue::Object(expected_value));
+  }
+
+  #[test]
+  fn it_should_parse_unary_plus_numbers() {
+    let result = parse_to_serde_value::<SerdeValue>(
+      r#"{
+        "pos1": +42,
+        "pos2": +0.5,
+        "pos3": +1e10
+      }"#,
+      &Default::default(),
+    )
+    .unwrap();
+
+    let mut expected_value = serde_json::map::Map::new();
+    expected_value.insert("pos1".to_string(), SerdeValue::Number(serde_json::Number::from(42)));
+    expected_value.insert(
+      "pos2".to_string(),
+      SerdeValue::Number(serde_json::Number::from_str("0.5").unwrap()),
+    );
+    expected_value.insert(
+      "pos3".to_string(),
+      SerdeValue::Number(serde_json::Number::from_str("1e10").unwrap()),
+    );
+
+    assert_eq!(result, SerdeValue::Object(expected_value));
+  }
+
+  #[test]
+  fn it_should_error_when_number_is_out_of_f64_range() {
+    assert_has_error(r#"{ "amount": 1e400 }"#, "Number is out of range on line 1 column 13");
+    assert_has_error("[-1e400]", "Number is out of range on line 1 column 2");
+    assert_has_error("1.7976931348623159e308", "Number is out of range on line 1 column 1");
+
+    // deserializing to a float should error as well instead of resolving to infinity
+    let err = parse_to_serde_value::<f64>("1e400", &Default::default()).unwrap_err();
+    assert_eq!(err.to_string(), "Number is out of range on line 1 column 1");
+
+    // the number being out of range still errors when the value is ignored
+    #[derive(::serde::Deserialize, Debug, PartialEq)]
+    #[serde(crate = "::serde")]
+    struct Amount {
+      amount: u32,
+    }
+    let err = parse_to_serde_value::<Amount>(r#"{ "amount": 1, "other": 1e400 }"#, &Default::default()).unwrap_err();
+    assert_eq!(err.to_string(), "Number is out of range on line 1 column 25");
+
+    // numbers that underflow are fine
+    let result = parse_to_serde_value::<f64>("1e-400", &Default::default()).unwrap();
+    assert_eq!(result, 0.0);
+    let result = parse_to_serde_value::<f64>("-1e-400", &Default::default()).unwrap();
+    assert_eq!(result, -0.0);
+    assert!(result.is_sign_negative());
+
+    // the largest finite f64 is fine
+    let result = parse_to_serde_value::<f64>("1.7976931348623157e308", &Default::default()).unwrap();
+    assert_eq!(result, f64::MAX);
+  }
+
+  #[test]
+  fn it_should_error_when_hexadecimal_number_is_out_of_range() {
+    assert_has_error(
+      r#"{ "value": 0xFFFFFFFFFFFFFFFFFF }"#,
+      "Number is out of range on line 1 column 12",
+    );
+    assert_has_error("-0x8000000000000001", "Number is out of range on line 1 column 1");
+
+    // hexadecimal numbers that don't fit in an i64, but fit in a u64
+    let result = parse_to_serde_value::<u64>("0x8000000000000000", &Default::default()).unwrap();
+    assert_eq!(result, 9223372036854775808);
+
+    // i64::MIN
+    let result = parse_to_serde_value::<i64>("-0x8000000000000000", &Default::default()).unwrap();
+    assert_eq!(result, i64::MIN);
+  }
+
+  #[test]
+  fn it_should_deserialize_to_struct() {
+    #[derive(::serde::Deserialize, Debug, PartialEq)]
+    #[serde(crate = "::serde")]
+    struct Config {
+      name: String,
+      value: u32,
+      enabled: bool,
+    }
+
+    let result: Config = parse_to_serde_value(
+      r#"{ "name": "test", "value": 42, "enabled": true }"#,
+      &Default::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+      result,
+      Config {
+        name: "test".to_string(),
+        value: 42,
+        enabled: true,
+      }
+    );
+  }
+
+  #[test]
+  fn it_should_report_position_on_type_error() {
+    #[derive(::serde::Deserialize, Debug)]
+    #[serde(crate = "::serde")]
+    #[allow(dead_code)]
+    struct Config {
+      name: String,
+    }
+
+    let text = r#"{
+  "name": true
+}"#;
+    let err = parse_to_serde_value::<Config>(text, &Default::default()).unwrap_err();
+    // the error should point at `true` (line 2, column 11)
+    assert_eq!(err.line_display(), 2);
+    assert_eq!(err.column_display(), 11);
+    assert!(err.to_string().contains("invalid type"), "got: {}", err);
+  }
+
+  #[test]
+  fn it_should_deserialize_option_fields() {
+    #[derive(::serde::Deserialize, Debug, PartialEq)]
+    #[serde(crate = "::serde")]
+    struct Config {
+      a: Option<u32>,
+      b: Option<u32>,
+    }
+
+    let result: Config = parse_to_serde_value(r#"{ "a": 5, "b": null }"#, &Default::default()).unwrap();
+
+    assert_eq!(result, Config { a: Some(5), b: None });
+  }
+
+  #[test]
+  fn it_should_deserialize_enum() {
+    #[derive(::serde::Deserialize, Debug, PartialEq)]
+    #[serde(crate = "::serde")]
+    enum Color {
+      Red,
+      Green,
+      Blue,
+    }
+
+    #[derive(::serde::Deserialize, Debug, PartialEq)]
+    #[serde(crate = "::serde")]
+    struct Config {
+      color: Color,
+    }
+
+    let result: Config = parse_to_serde_value(r#"{ "color": "Red" }"#, &Default::default()).unwrap();
+
+    assert_eq!(result, Config { color: Color::Red });
+  }
+
+  #[test]
+  fn it_should_deserialize_complex_enum() {
+    #[derive(::serde::Deserialize, Debug, PartialEq)]
+    #[serde(crate = "::serde")]
+    enum Shape {
+      Circle(f64),
+      Rectangle { width: f64, height: f64 },
+    }
+
+    let result: Shape = parse_to_serde_value(r#"{ "Circle": 5.0 }"#, &Default::default()).unwrap();
+    assert_eq!(result, Shape::Circle(5.0));
+
+    let result: Shape = parse_to_serde_value(
+      r#"{ "Rectangle": { "width": 3.0, "height": 4.0 } }"#,
+      &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(
+      result,
+      Shape::Rectangle {
+        width: 3.0,
+        height: 4.0
+      }
+    );
+  }
+
+  #[test]
+  fn it_should_return_null_for_empty_input() {
+    let result = parse_to_serde_value::<SerdeValue>("", &Default::default()).unwrap();
+    assert_eq!(result, SerdeValue::Null);
+  }
+
+  #[test]
+  fn it_should_return_none_for_empty_input_with_option() {
+    let result: Option<SerdeValue> = parse_to_serde_value("", &Default::default()).unwrap();
+    assert_eq!(result, None);
+  }
+
+  #[test]
+  fn it_should_return_some_for_non_empty_input_with_option() {
+    let result: Option<SerdeValue> = parse_to_serde_value(r#"{ "a": 1 }"#, &Default::default()).unwrap();
+    assert!(result.is_some());
+  }
+
+  #[test]
+  fn it_should_return_none_for_empty_input_with_option_struct() {
+    #[derive(::serde::Deserialize, Debug, PartialEq)]
+    #[serde(crate = "::serde")]
+    struct Config {
+      value: u32,
+    }
+
+    let result: Option<Config> = parse_to_serde_value("", &Default::default()).unwrap();
+    assert_eq!(result, None);
+
+    let result: Option<Config> = parse_to_serde_value("  \n  ", &Default::default()).unwrap();
+    assert_eq!(result, None);
+  }
+
+  #[test]
+  fn it_should_deserialize_tuples() {
+    // 1-element
+    let result: (u8,) = parse_to_serde_value("[1]", &Default::default()).unwrap();
+    assert_eq!(result, (1,));
+
+    // 2-element with mixed types
+    let result: (u8, String) = parse_to_serde_value(r#"[1, "hello"]"#, &Default::default()).unwrap();
+    assert_eq!(result, (1, "hello".to_string()));
+
+    // 3-element in an object
+    #[derive(::serde::Deserialize, Debug, PartialEq)]
+    #[serde(crate = "::serde")]
+    struct Config {
+      version: (u8, u8, u8),
+    }
+    let result: Config = parse_to_serde_value(r#"{ "version": [0, 3, 0] }"#, &Default::default()).unwrap();
+    assert_eq!(result, Config { version: (0, 3, 0) });
+
+    // 6-element
+    let result: (u8, u8, u8, u8, u8, u8) = parse_to_serde_value("[1, 2, 3, 4, 5, 6]", &Default::default()).unwrap();
+    assert_eq!(result, (1, 2, 3, 4, 5, 6));
+
+    // 9-element
+    let result: (u8, u8, u8, u8, u8, u8, u8, u8, u8) =
+      parse_to_serde_value("[1, 2, 3, 4, 5, 6, 7, 8, 9]", &Default::default()).unwrap();
+    assert_eq!(result, (1, 2, 3, 4, 5, 6, 7, 8, 9));
+
+    // 12-element
+    let result: (u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8) =
+      parse_to_serde_value("[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]", &Default::default()).unwrap();
+    assert_eq!(result, (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12));
+  }
+
+  #[test]
+  fn it_should_handle_comments_in_jsonc() {
+    #[derive(::serde::Deserialize, Debug, PartialEq)]
+    #[serde(crate = "::serde")]
+    struct Config {
+      value: u32,
+    }
+
+    let result: Config = parse_to_serde_value(
+      r#"{
+        // this is a comment
+        "value": 42 /* inline comment */
+      }"#,
+      &Default::default(),
+    )
+    .unwrap();
+
+    assert_eq!(result, Config { value: 42 });
+  }
+
+  #[test]
+  fn missing_comma_between_array_elements() {
+    let result = parse_to_serde_value::<SerdeValue>("[1 2]", &Default::default()).unwrap();
+    assert_eq!(result, serde_json::json!([1, 2]));
+
+    // but is strict when strict
+    assert_has_strict_error("[1 2]", "Expected comma on line 1 column 3");
+    assert_has_strict_error("[01]", "Expected comma on line 1 column 3");
+    assert_has_strict_error(r#"["a" "b"]"#, "Expected comma on line 1 column 5");
+    assert_has_strict_error("[true false]", "Expected comma on line 1 column 6");
+    assert_has_strict_error("[null null]", "Expected comma on line 1 column 6");
+    assert_has_strict_error("[[1] [2]]", "Expected comma on line 1 column 5");
+    assert_has_strict_error(r#"[{"a":1} {"b":2}]"#, "Expected comma on line 1 column 9");
+
+    for text in ["[]", "[1,2]", "[1 , 2]", "[[1],[2]]", r#"[{"a":1},{"b":2}]"#] {
+      parse_to_serde_value_strict::<SerdeValue>(text).unwrap();
+    }
+  }
+
+  #[test]
+  fn missing_comma_between_array_elements_when_draining() {
+    // a tuple stops reading before the end of the array, so the
+    // remaining elements are drained and should still be strict
+    assert_has_strict_drain_error::<(u32,)>("[1 2]", "Expected comma on line 1 column 3");
+    // the drained element here ends with a `}`
+    assert_has_strict_drain_error::<(u32, SerdeValue)>(r#"[1, {"a":2} 3]"#, "Expected comma on line 1 column 12");
+  }
+
+  #[test]
+  fn missing_comma_with_comment_between_array_elements() {
+    // when comments are allowed but missing commas are not,
+    // should still detect the missing comma after the comment is skipped
+    let result = parse_to_serde_value::<SerdeValue>(
+      r#"[
+  1 // comment here
+  2
+]"#,
+      &ParseOptions {
+        allow_comments: true,
+        allow_missing_commas: false,
+        ..Default::default()
+      },
+    );
+    match result {
+      Ok(_) => panic!("Expected error, but did not find one."),
+      Err(err) => assert_eq!(err.to_string(), "Expected comma on line 2 column 4"),
+    }
+  }
+
+  #[track_caller]
+  fn assert_has_strict_error(text: &str, message: &str) {
+    match parse_to_serde_value_strict::<SerdeValue>(text) {
+      Ok(_) => panic!("Expected error, but did not find one."),
+      Err(err) => assert_eq!(err.to_string(), message),
+    }
+  }
+
+  #[track_caller]
+  fn assert_has_strict_drain_error<T: ::serde::de::DeserializeOwned>(text: &str, message: &str) {
+    match parse_to_serde_value_strict::<T>(text) {
+      Ok(_) => panic!("Expected error, but did not find one."),
+      Err(err) => assert_eq!(err.to_string(), message),
+    }
+  }
+
+  fn parse_to_serde_value_strict<T: ::serde::de::DeserializeOwned>(text: &str) -> Result<T, ParseError> {
+    parse_to_serde_value(
+      text,
+      &ParseOptions {
+        allow_comments: false,
+        allow_loose_object_property_names: false,
+        allow_trailing_commas: false,
+        allow_missing_commas: false,
+        allow_single_quoted_strings: false,
+        allow_hexadecimal_numbers: false,
+        allow_unary_plus_numbers: false,
+      },
+    )
+  }
+}
